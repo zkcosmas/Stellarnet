@@ -1,13 +1,20 @@
-;; Cosmic Resource Trading Network - Basic Framework
-;; Stage 1: Core functionality for resource registration and trading
+;; Cosmic Resource Trading Network - Updated Framework
+;; Stage 2: Advanced functionality with extraction completion and reputation system
 
 ;; System error definitions
 (define-constant ACCESS-VIOLATION-CODE (err u301))
 (define-constant ALREADY-REGISTERED-CODE (err u302))
 (define-constant CREDITS-INSUFFICIENT-CODE (err u303))
 (define-constant RESOURCE-NOT-FOUND-CODE (err u304))
+(define-constant EXTRACTION-PENDING-CODE (err u305))
+(define-constant RESOURCE-MASS-LIMIT-CODE (err u306))
+(define-constant EXTRACTION-FEE-BOUNDS-CODE (err u307))
+(define-constant STABILITY-PERIOD-CODE (err u308))
 (define-constant INVALID-RESOURCE-REFERENCE-CODE (err u309))
+(define-constant DECOMMISSIONED-STATUS-CODE (err u311))
 (define-constant DEPOSIT-TOO-SMALL-CODE (err u312))
+(define-constant COORDINATES-EMPTY-CODE (err u313))
+(define-constant COMPOSITION-EMPTY-CODE (err u314))
 (define-constant NETWORK-MAX-VALUE u2000000000)
 
 ;; Core data structures
@@ -17,6 +24,9 @@
     discoverer: principal,
     current-extractor: (optional principal),
     resource-mass: uint,
+    discoverer-fee: uint,
+    stability-period: uint,
+    registration-timestamp: (optional uint),
     spatial-coordinates: (string-ascii 30),
     elemental-composition: (string-ascii 20),
     trading-status: (string-ascii 20)
@@ -25,17 +35,25 @@
 
 (define-map credit-repository principal uint)
 
+(define-map explorer-reputation-index principal uint)
+
 (define-map explorer-discovery-registry
   principal
   (list 10 uint)
 )
 
 ;; Core business logic implementations
-(define-public (register-cosmic-discovery (resource-mass uint) (spatial-coordinates (string-ascii 30)) 
+(define-public (register-cosmic-discovery (resource-mass uint) (discoverer-fee uint) (stability-period uint)
+                             (spatial-coordinates (string-ascii 30)) 
                              (elemental-composition (string-ascii 20)))
   (let ((resource-id (+ (var-get discovery-sequence) u1)))
-    ;; Input validation
-    (asserts! (> resource-mass u0) (err u306))
+    ;; Input validation suite
+    (asserts! (> resource-mass u0) RESOURCE-MASS-LIMIT-CODE)
+    (asserts! (<= discoverer-fee u50) EXTRACTION-FEE-BOUNDS-CODE)
+    (asserts! (and (> stability-period u0) (<= stability-period u10000)) STABILITY-PERIOD-CODE)
+    ;; Coordinates and composition validation
+    (asserts! (> (len spatial-coordinates) u0) COORDINATES-EMPTY-CODE)
+    (asserts! (> (len elemental-composition) u0) COMPOSITION-EMPTY-CODE)
     
     ;; Register the new cosmic resource
     (map-set cosmic-resource-registry 
@@ -44,6 +62,9 @@
         discoverer: tx-sender,
         current-extractor: none,
         resource-mass: resource-mass,
+        discoverer-fee: discoverer-fee,
+        stability-period: stability-period,
+        registration-timestamp: none,
         spatial-coordinates: spatial-coordinates,
         elemental-composition: elemental-composition,
         trading-status: "AVAILABLE"
@@ -80,6 +101,7 @@
     (map-set cosmic-resource-registry { resource-id: resource-id }
       (merge resource-details { 
         current-extractor: (some tx-sender),
+        registration-timestamp: (some block-height),
         trading-status: "RIGHTS_CLAIMED"
       })
     )
@@ -90,6 +112,61 @@
       (+ (default-to u0 (map-get? credit-repository (get discoverer resource-details))) 
          (get resource-mass resource-details)))
     
+    (ok true)
+  )
+)
+
+(define-public (complete-extraction (resource-id uint))
+  (let (
+    (resource-details (unwrap! (map-get? cosmic-resource-registry { resource-id: resource-id }) RESOURCE-NOT-FOUND-CODE))
+    (extractor-balance (default-to u0 (map-get? credit-repository tx-sender)))
+    (initial-cost (get resource-mass resource-details))
+    (discovery-bonus (/ (* (get resource-mass resource-details) (get discoverer-fee resource-details)) u100))
+    (total-payment (+ initial-cost discovery-bonus))
+  )
+    ;; Comprehensive validation checks
+    (asserts! (<= resource-id (var-get discovery-sequence)) INVALID-RESOURCE-REFERENCE-CODE)
+    (asserts! (is-eq (get current-extractor resource-details) (some tx-sender)) ACCESS-VIOLATION-CODE)
+    (asserts! (is-eq (get trading-status resource-details) "RIGHTS_CLAIMED") RESOURCE-NOT-FOUND-CODE)
+    (asserts! (>= (- block-height (unwrap! (get registration-timestamp resource-details) RESOURCE-NOT-FOUND-CODE)) 
+                (get stability-period resource-details)) EXTRACTION-PENDING-CODE)
+    (asserts! (>= extractor-balance total-payment) CREDITS-INSUFFICIENT-CODE)
+    
+    ;; Execute payment to discoverer
+    (map-set credit-repository tx-sender (- extractor-balance total-payment))
+    (map-set credit-repository (get discoverer resource-details) 
+      (+ (default-to u0 (map-get? credit-repository (get discoverer resource-details))) 
+         total-payment)
+    )
+    
+    ;; Update discoverer's reputation score
+    (let ((reputation-score (default-to u0 (map-get? explorer-reputation-index 
+                        (get discoverer resource-details)))))
+      (map-set explorer-reputation-index
+        (get discoverer resource-details)
+        (+ reputation-score u1)
+      )
+    )
+    
+    ;; Update resource lifecycle status
+    (map-set cosmic-resource-registry { resource-id: resource-id } 
+      (merge resource-details { trading-status: "EXTRACTION_COMPLETE" }))
+    (ok true)
+  )
+)
+
+(define-public (decommission-resource (resource-id uint))
+  (let (
+    (resource-details (unwrap! (map-get? cosmic-resource-registry { resource-id: resource-id }) RESOURCE-NOT-FOUND-CODE))
+  )
+    ;; Security validations
+    (asserts! (<= resource-id (var-get discovery-sequence)) INVALID-RESOURCE-REFERENCE-CODE)
+    (asserts! (is-eq (get discoverer resource-details) tx-sender) ACCESS-VIOLATION-CODE)
+    (asserts! (is-eq (get trading-status resource-details) "AVAILABLE") RESOURCE-NOT-FOUND-CODE)
+    
+    ;; Change trading status
+    (map-set cosmic-resource-registry { resource-id: resource-id } 
+      (merge resource-details { trading-status: "DECOMMISSIONED" }))
     (ok true)
   )
 )
@@ -116,6 +193,10 @@
 
 (define-read-only (check-explorer-balance (entity principal))
   (default-to u0 (map-get? credit-repository entity))
+)
+
+(define-read-only (get-explorer-reputation (explorer principal))
+  (default-to u0 (map-get? explorer-reputation-index explorer))
 )
 
 (define-read-only (list-discovered-resources (entity principal))
